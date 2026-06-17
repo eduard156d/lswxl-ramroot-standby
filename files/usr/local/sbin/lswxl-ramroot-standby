@@ -91,7 +91,7 @@ check()
 	log "arch=$(uname -m)"
 	log "switch=$(switch_mode)"
 	log "root=$(findmnt -n -o SOURCE,FSTYPE,OPTIONS / 2>/dev/null || echo unknown)"
-	for cmd in busybox pivot_root chroot mount umount switch_root unshare ip ps awk sed grep sync; do
+	for cmd in busybox pivot_root chroot mount umount switch_root unshare ip ps awk sed grep sort cat sleep sync date od basename mkdir readlink poweroff reboot halt mdadm hdparm blockdev findmnt blkid lsblk lswxl-wait-wake-switch; do
 		check_cmd "$cmd"
 	done
 	log "block devices:"

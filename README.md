@@ -34,6 +34,44 @@ Installed command:
 /usr/local/sbin/lswxl-ramroot-standby
 ```
 
+## Installation
+
+Clone the repository on the target Buffalo system and run the installer as
+root:
+
+```sh
+git clone https://github.com/eduard156d/lswxl-ramroot-standby.git
+cd lswxl-ramroot-standby
+./install.sh
+```
+
+The installer:
+
+- installs runtime/build dependencies with `apt-get` when available
+- installs `/usr/local/sbin/lswxl-ramroot-standby`
+- builds and installs `/usr/local/sbin/lswxl-wait-wake-switch` from local C
+  source
+- installs `/etc/default/lswxl-ramroot-standby.example`
+- creates `/etc/default/lswxl-ramroot-standby` when it does not exist
+- keeps existing config values and appends only missing config keys on upgrades
+- runs a non-destructive `lswxl-ramroot-standby check`
+
+Useful installer options:
+
+```sh
+# Do not run apt-get.
+INSTALL_APT_DEPS=0 ./install.sh
+
+# Do not run the final check.
+RUN_CHECK=0 ./install.sh
+
+# Use a specific compiler.
+CC=gcc ./install.sh
+```
+
+After installation, review `/etc/default/lswxl-ramroot-standby` carefully before
+enabling power rails or running a real standby test.
+
 Supported commands:
 
 ```sh
