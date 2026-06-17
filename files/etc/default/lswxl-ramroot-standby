@@ -1,0 +1,123 @@
+# /etc/default/lswxl-ramroot-standby
+#
+# Configuration for the experimental LS-WXL RAM-root standby helper.
+# Empty values usually mean "disabled" or "auto-detect"; see each option.
+
+# Network interface used by the UDP magic-packet wake helper.
+ETH_DEV=eth0
+
+# Optional external log device. Leave empty to disable USB/file logging.
+# Always use a stable /dev/disk/by-uuid/... path here. Do not use /dev/sdX
+# names because device ordering may change after USB/SATA power cycling.
+# Example:
+#   LOG_DEVICE=/dev/disk/by-uuid/YOUR-USB-LOG-UUID
+LOG_DEVICE=
+LOG_FSTYPE=auto
+LOG_FILE=lswxl-ramroot-standby.log
+
+# If LOG_DEVICE is configured and the USB rail is switched off, the helper
+# closes the log before USB poweroff and waits up to this many seconds after
+# USB power restore for the log block device to reappear. This wait is skipped
+# completely when LOG_DEVICE is empty.
+STANDBY_LOG_DEVICE_WAIT_SEC=10
+
+# Controls expensive diagnostic-only dumps such as full mount lists, process
+# references, oldroot block state, and storage state snapshots.
+#
+#   auto  run diagnostics only when LOG_DEVICE is configured and available
+#   1     always run diagnostics, even without a file log device
+#   0     skip diagnostic-only probes
+#
+# Safety-critical actions such as sync, oldroot unmount attempts, storage
+# settle, mdadm, hdparm, rail control, fan control, and wake handling are not
+# disabled by this setting.
+STANDBY_DIAGNOSTICS=auto
+
+# UDP ports accepted for magic-packet wake.
+WAKE_PORTS="9 2304"
+
+# Standby wait timeout in seconds. 0 means wait indefinitely.
+WAKE_TIMEOUT=300
+
+# Only prepare standby when the physical switch is in this position.
+# Recommended: AUTO
+STANDBY_ALLOWED_SWITCH=AUTO
+
+# Poll interval for the physical switch while in standby.
+# 0 disables polling; input-event wake remains active when available.
+STANDBY_SWITCH_POLL_SEC=2
+STANDBY_INPUT_EVENT=/dev/input/event0
+
+# FAN cooldown after disks/rails were prepared for standby.
+# The fan keeps running for this many seconds while the wake wait is already
+# active. A magic packet or switch change still leaves standby immediately.
+# 0 means stop the fan immediately when standby wait starts.
+#
+# Example for shorter tests:
+#   STANDBY_FAN_COOLDOWN_SEC=60
+STANDBY_FAN_COOLDOWN_SEC=120
+
+# Storage handling before power rails are switched off.
+# Modes:
+#   log              only log block/md state
+#   standby          flush selected disks and run hdparm -y
+#   md-stop-standby  best-effort mdadm --stop, then flush and hdparm -y
+STANDBY_STORAGE_MODE=log
+
+# Disks to flush and put into ATA standby before standby wait.
+# Empty means auto-detect all visible SATA disks at standby runtime.
+# USB disks are intentionally skipped by auto-detection so a USB log stick can
+# remain online.
+#
+# Examples:
+#   STANDBY_STORAGE_DISKS=
+#   STANDBY_STORAGE_DISKS="/dev/sda /dev/sdb"
+STANDBY_STORAGE_DISKS=
+
+# Wait this many seconds for ext4/md writeback threads to settle before the
+# disk standby action. The helper continues even when the timeout expires.
+STANDBY_STORAGE_SETTLE_SEC=30
+
+# Board power rails to switch off while waiting in standby.
+# This is intentionally explicit: rail names are board-specific and must match
+# the mappings below. Leave empty unless the mapping was verified.
+#
+# Tested LS-WXL example:
+#   STANDBY_POWER_RAILS="HDD0 HDD1"
+#
+# Optional USB example, normally not used while USB logging is needed:
+#   STANDBY_POWER_RAILS="HDD0 HDD1 USB"
+STANDBY_POWER_RAILS=
+
+# Delay after switching power rails back on, before handing control back to
+# the final systemd poweroff path. This gives disks time to spin up.
+STANDBY_POWER_RESTORE_DELAY_SEC=8
+
+# Power-rail mapping.
+#
+# The LS-WXL Device Tree exposes fixed regulators like this:
+#   /sys/class/regulator/regulator.1/name = USB Power
+#   /sys/class/regulator/regulator.2/name = HDD0 Power
+#   /sys/class/regulator/regulator.3/name = HDD1 Power
+#
+# On the tested LS-WXL, the matching platform devices and GPIOs are:
+#   USB  -> regulators:regulator@1 -> GPIO37
+#   HDD0 -> regulators:regulator@2 -> GPIO28
+#   HDD1 -> regulators:regulator@3 -> GPIO29
+#
+# Verify on your device before enabling STANDBY_POWER_RAILS:
+#   for r in /sys/class/regulator/regulator.*; do
+#       echo "== $r =="; cat "$r/name" 2>/dev/null; cat "$r/state" 2>/dev/null
+#   done
+#   mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+#   cat /sys/kernel/debug/gpio | grep 'regulators:regulator'
+#
+# The helper temporarily unbinds the fixed-regulator platform device, exports
+# the GPIO, switches it low during standby, switches it high on wake, then
+# binds the regulator again.
+STANDBY_POWER_RAIL_HDD0_DEV=regulators:regulator@2
+STANDBY_POWER_RAIL_HDD0_GPIO=28
+STANDBY_POWER_RAIL_HDD1_DEV=regulators:regulator@3
+STANDBY_POWER_RAIL_HDD1_GPIO=29
+STANDBY_POWER_RAIL_USB_DEV=regulators:regulator@1
+STANDBY_POWER_RAIL_USB_GPIO=37

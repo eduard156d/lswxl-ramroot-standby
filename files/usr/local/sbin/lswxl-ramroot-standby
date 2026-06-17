@@ -1,0 +1,1331 @@
+#!/bin/sh
+set -eu
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN_DIR=/run/lswxl-ramroot-standby
+ROOT_DIR=$RUN_DIR/root
+EXITRD_DIR=/run/initramfs
+REQUEST_FILE=$RUN_DIR/request
+ENV_FILE=$RUN_DIR/env
+REQUEST_DEV_FILE=/dev/.lswxl-ramroot-standby-request
+ENV_DEV_FILE=/dev/.lswxl-ramroot-standby-env
+DEFAULTS=/etc/default/lswxl-ramroot-standby
+
+ETH_DEV=eth0
+LOG_DEVICE=
+LOG_FSTYPE=auto
+LOG_FILE=lswxl-ramroot-standby.log
+STANDBY_LOG_DEVICE_WAIT_SEC=10
+STANDBY_DIAGNOSTICS=auto
+WAKE_PORTS="9 2304"
+WAKE_TIMEOUT=300
+STANDBY_ALLOWED_SWITCH=AUTO
+STANDBY_SWITCH_POLL_SEC=2
+STANDBY_INPUT_EVENT=/dev/input/event0
+STANDBY_FAN_COOLDOWN_SEC=120
+STANDBY_STORAGE_MODE=log
+STANDBY_STORAGE_DISKS=
+STANDBY_STORAGE_SETTLE_SEC=30
+STANDBY_POWER_RAILS=
+STANDBY_POWER_RESTORE_DELAY_SEC=8
+STANDBY_POWER_RAIL_HDD0_DEV=regulators:regulator@2
+STANDBY_POWER_RAIL_HDD0_GPIO=28
+STANDBY_POWER_RAIL_HDD1_DEV=regulators:regulator@3
+STANDBY_POWER_RAIL_HDD1_GPIO=29
+STANDBY_POWER_RAIL_USB_DEV=regulators:regulator@1
+STANDBY_POWER_RAIL_USB_GPIO=37
+
+[ -r "$DEFAULTS" ] && . "$DEFAULTS"
+
+log()
+{
+	printf '%s\n' "$*"
+}
+
+fail()
+{
+	printf 'ERROR: %s\n' "$*" >&2
+	exit 1
+}
+
+need_root()
+{
+	[ "$(id -u)" = 0 ] || fail "run as root"
+}
+
+switch_mode()
+{
+	mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+	line_on="$(grep 'Power-on Switch' /sys/kernel/debug/gpio 2>/dev/null || true)"
+	line_auto="$(grep 'Power-auto Switch' /sys/kernel/debug/gpio 2>/dev/null || true)"
+	case "$line_on" in *' lo '*) on_active=1 ;; *) on_active=0 ;; esac
+	case "$line_auto" in *' lo '*) auto_active=1 ;; *) auto_active=0 ;; esac
+
+	if [ "$on_active" -eq 1 ] && [ "$auto_active" -eq 0 ]; then
+		echo ON
+	elif [ "$on_active" -eq 0 ] && [ "$auto_active" -eq 1 ]; then
+		echo AUTO
+	elif [ "$on_active" -eq 0 ] && [ "$auto_active" -eq 0 ]; then
+		echo OFF
+	else
+		echo UNKNOWN
+	fi
+}
+
+check_cmd()
+{
+	cmd="$1"
+	if command -v "$cmd" >/dev/null 2>&1; then
+		log "ok: $cmd=$(command -v "$cmd")"
+	else
+		log "missing: $cmd"
+	fi
+}
+
+check()
+{
+	need_root
+	log "model=$(tr -d '\000' </proc/device-tree/model 2>/dev/null || echo unknown)"
+	log "kernel=$(uname -r)"
+	log "arch=$(uname -m)"
+	log "switch=$(switch_mode)"
+	log "root=$(findmnt -n -o SOURCE,FSTYPE,OPTIONS / 2>/dev/null || echo unknown)"
+	for cmd in busybox pivot_root chroot mount umount switch_root unshare ip ps awk sed grep sync; do
+		check_cmd "$cmd"
+	done
+	log "block devices:"
+	lsblk -o NAME,SIZE,TYPE,TRAN,FSTYPE,MOUNTPOINTS 2>/dev/null || true
+}
+
+write_request()
+{
+	mode="$1"
+	mkdir -p "$RUN_DIR"
+	cat > "$ENV_FILE" <<EOF
+MODE=$mode
+ETH_DEV=$ETH_DEV
+LOG_DEVICE=$LOG_DEVICE
+LOG_FSTYPE=$LOG_FSTYPE
+LOG_FILE=$LOG_FILE
+STANDBY_LOG_DEVICE_WAIT_SEC=$STANDBY_LOG_DEVICE_WAIT_SEC
+STANDBY_DIAGNOSTICS=$STANDBY_DIAGNOSTICS
+WAKE_PORTS="$WAKE_PORTS"
+WAKE_TIMEOUT=$WAKE_TIMEOUT
+STANDBY_SWITCH_POLL_SEC=$STANDBY_SWITCH_POLL_SEC
+STANDBY_INPUT_EVENT=$STANDBY_INPUT_EVENT
+STANDBY_FAN_COOLDOWN_SEC=$STANDBY_FAN_COOLDOWN_SEC
+STANDBY_STORAGE_MODE=$STANDBY_STORAGE_MODE
+STANDBY_STORAGE_DISKS="$STANDBY_STORAGE_DISKS"
+STANDBY_STORAGE_SETTLE_SEC=$STANDBY_STORAGE_SETTLE_SEC
+STANDBY_POWER_RAILS="$STANDBY_POWER_RAILS"
+STANDBY_POWER_RESTORE_DELAY_SEC=$STANDBY_POWER_RESTORE_DELAY_SEC
+STANDBY_POWER_RAIL_HDD0_DEV="$STANDBY_POWER_RAIL_HDD0_DEV"
+STANDBY_POWER_RAIL_HDD0_GPIO="$STANDBY_POWER_RAIL_HDD0_GPIO"
+STANDBY_POWER_RAIL_HDD1_DEV="$STANDBY_POWER_RAIL_HDD1_DEV"
+STANDBY_POWER_RAIL_HDD1_GPIO="$STANDBY_POWER_RAIL_HDD1_GPIO"
+STANDBY_POWER_RAIL_USB_DEV="$STANDBY_POWER_RAIL_USB_DEV"
+STANDBY_POWER_RAIL_USB_GPIO="$STANDBY_POWER_RAIL_USB_GPIO"
+SWITCH_AT_REQUEST=$(switch_mode)
+EOF
+	cp "$ENV_FILE" "$ENV_DEV_FILE"
+	: > "$REQUEST_FILE"
+	: > "$REQUEST_DEV_FILE"
+}
+
+status()
+{
+	log "switch=$(switch_mode)"
+	log "standby_allowed_switch=$STANDBY_ALLOWED_SWITCH"
+	log "log_device=${LOG_DEVICE:-none}"
+	if [ -e "$REQUEST_FILE" ] || [ -e "$REQUEST_DEV_FILE" ]; then
+		log "request=present"
+		cat "$ENV_FILE" 2>/dev/null || true
+		cat "$ENV_DEV_FILE" 2>/dev/null || true
+	else
+		log "request=absent"
+	fi
+}
+
+require_standby_switch()
+{
+	current="$(switch_mode)"
+	for allowed in $STANDBY_ALLOWED_SWITCH; do
+		if [ "$current" = "$allowed" ]; then
+			return 0
+		fi
+	done
+	fail "standby requires switch=$STANDBY_ALLOWED_SWITCH, current=$current"
+}
+
+write_exitrd_shutdown_script()
+{
+	mode="${1:-standby}"
+	cat > "$EXITRD_DIR/shutdown" <<EOF
+#!/bin/sh
+set -eu
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/sbin
+ACTION="\${1:-poweroff}"
+export ETH_DEV='$ETH_DEV'
+export LOG_DEVICE='$LOG_DEVICE'
+export LOG_FSTYPE='$LOG_FSTYPE'
+export LOG_FILE='$LOG_FILE'
+export STANDBY_LOG_DEVICE_WAIT_SEC='$STANDBY_LOG_DEVICE_WAIT_SEC'
+export STANDBY_DIAGNOSTICS='$STANDBY_DIAGNOSTICS'
+export WAKE_PORTS='$WAKE_PORTS'
+export WAKE_TIMEOUT='$WAKE_TIMEOUT'
+export STANDBY_SWITCH_POLL_SEC='$STANDBY_SWITCH_POLL_SEC'
+export STANDBY_INPUT_EVENT='$STANDBY_INPUT_EVENT'
+export STANDBY_FAN_COOLDOWN_SEC='$STANDBY_FAN_COOLDOWN_SEC'
+export STANDBY_STORAGE_MODE='$STANDBY_STORAGE_MODE'
+export STANDBY_STORAGE_DISKS='$STANDBY_STORAGE_DISKS'
+export STANDBY_STORAGE_SETTLE_SEC='$STANDBY_STORAGE_SETTLE_SEC'
+export STANDBY_POWER_RAILS='$STANDBY_POWER_RAILS'
+export STANDBY_POWER_RESTORE_DELAY_SEC='$STANDBY_POWER_RESTORE_DELAY_SEC'
+export STANDBY_POWER_RAIL_HDD0_DEV='$STANDBY_POWER_RAIL_HDD0_DEV'
+export STANDBY_POWER_RAIL_HDD0_GPIO='$STANDBY_POWER_RAIL_HDD0_GPIO'
+export STANDBY_POWER_RAIL_HDD1_DEV='$STANDBY_POWER_RAIL_HDD1_DEV'
+export STANDBY_POWER_RAIL_HDD1_GPIO='$STANDBY_POWER_RAIL_HDD1_GPIO'
+export STANDBY_POWER_RAIL_USB_DEV='$STANDBY_POWER_RAIL_USB_DEV'
+export STANDBY_POWER_RAIL_USB_GPIO='$STANDBY_POWER_RAIL_USB_GPIO'
+export STANDBY_INPUT_EVENT='$STANDBY_INPUT_EVENT'
+export STANDBY_FAN_COOLDOWN_SEC='$STANDBY_FAN_COOLDOWN_SEC'
+export STANDBY_STORAGE_MODE='$STANDBY_STORAGE_MODE'
+export STANDBY_STORAGE_DISKS='$STANDBY_STORAGE_DISKS'
+export STANDBY_STORAGE_SETTLE_SEC='$STANDBY_STORAGE_SETTLE_SEC'
+export STANDBY_POWER_RAILS='$STANDBY_POWER_RAILS'
+export STANDBY_POWER_RESTORE_DELAY_SEC='$STANDBY_POWER_RESTORE_DELAY_SEC'
+export STANDBY_POWER_RAIL_HDD0_DEV='$STANDBY_POWER_RAIL_HDD0_DEV'
+export STANDBY_POWER_RAIL_HDD0_GPIO='$STANDBY_POWER_RAIL_HDD0_GPIO'
+export STANDBY_POWER_RAIL_HDD1_DEV='$STANDBY_POWER_RAIL_HDD1_DEV'
+export STANDBY_POWER_RAIL_HDD1_GPIO='$STANDBY_POWER_RAIL_HDD1_GPIO'
+export STANDBY_POWER_RAIL_USB_DEV='$STANDBY_POWER_RAIL_USB_DEV'
+export STANDBY_POWER_RAIL_USB_GPIO='$STANDBY_POWER_RAIL_USB_GPIO'
+
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
+/standby-init '$mode' || true
+
+case "\$ACTION" in
+	reboot)
+		reboot -f || busybox reboot -f || true
+		;;
+	halt)
+		halt -f || busybox halt -f || true
+		;;
+	*)
+		poweroff -f || busybox poweroff -f || true
+		;;
+esac
+
+while :; do
+	sleep 3600
+done
+EOF
+	chmod 755 "$EXITRD_DIR/shutdown"
+}
+
+prepare_standby()
+{
+	need_root
+	require_standby_switch
+	clean >/dev/null 2>&1 || true
+	if [ -e "$EXITRD_DIR/.lswxl-ramroot-standby" ]; then
+		rm -rf "$EXITRD_DIR"
+	fi
+	mkdir -p "$EXITRD_DIR"
+	ROOT_DIR="$EXITRD_DIR"
+	build_root dir >/dev/null
+	: > "$EXITRD_DIR/.lswxl-ramroot-standby"
+	write_exitrd_shutdown_script standby
+	mount -o remount,exec /run 2>/dev/null || true
+	log "prepared exitrd standby at $EXITRD_DIR"
+	ls -l "$EXITRD_DIR/shutdown" "$EXITRD_DIR/standby-init"
+}
+
+copy_cmd()
+{
+	cmd="$1"
+	dst="$2"
+	src="$(command -v "$cmd" 2>/dev/null || true)"
+	[ -n "$src" ] || return 0
+	mkdir -p "$dst$(dirname "$src")"
+	cp -a "$src" "$dst$src"
+	copy_libs "$src" "$dst"
+}
+
+copy_one_lib()
+{
+	lib="$1"
+	dst="$2"
+	[ -e "$lib" ] || return 0
+	mkdir -p "$dst$(dirname "$lib")"
+	cp -aL "$lib" "$dst$lib" 2>/dev/null || true
+}
+
+copy_libs()
+{
+	bin="$1"
+	dst="$2"
+	ldd "$bin" 2>/dev/null |
+	while read -r a b c rest; do
+		case "$a" in
+			/*) copy_one_lib "$a" "$dst" ;;
+		esac
+		case "$c" in
+			/*) copy_one_lib "$c" "$dst" ;;
+		esac
+	done
+}
+
+build_root()
+{
+	need_root
+	root_as_mount=1
+	[ "${1:-}" = dir ] && root_as_mount=0
+	if mountpoint -q "$ROOT_DIR" 2>/dev/null; then
+		umount "$ROOT_DIR"
+	fi
+	rm -rf "$ROOT_DIR"
+	mkdir -p "$ROOT_DIR"
+	if [ "$root_as_mount" -eq 1 ]; then
+		mount -t tmpfs -o rw,exec,nosuid,nodev,mode=755,size=32m tmpfs "$ROOT_DIR"
+	fi
+	mkdir -p \
+		"$ROOT_DIR/bin" \
+		"$ROOT_DIR/sbin" \
+		"$ROOT_DIR/usr/bin" \
+		"$ROOT_DIR/usr/sbin" \
+		"$ROOT_DIR/usr/local/sbin" \
+		"$ROOT_DIR/proc" \
+		"$ROOT_DIR/sys" \
+		"$ROOT_DIR/dev" \
+		"$ROOT_DIR/run" \
+		"$ROOT_DIR/tmp" \
+		"$ROOT_DIR/oldroot"
+	chmod 1777 "$ROOT_DIR/tmp"
+
+	for cmd in busybox sh mount umount ip ps awk sed grep sort cat sleep sync date od basename mkdir readlink chroot pivot_root poweroff reboot halt mdadm hdparm blockdev findmnt tr blkid; do
+		copy_cmd "$cmd" "$ROOT_DIR"
+	done
+	copy_cmd lswxl-ramroot-wait-wake "$ROOT_DIR"
+	copy_cmd lswxl-wait-wake-switch "$ROOT_DIR"
+
+	if command -v busybox >/dev/null 2>&1; then
+		cp -a "$(command -v busybox)" "$ROOT_DIR/bin/busybox"
+		copy_libs "$(command -v busybox)" "$ROOT_DIR"
+		for app in sh mount umount cat echo sleep sync ps ip grep sed awk sort date od basename mkdir printf readlink poweroff reboot halt; do
+			rm -f "$ROOT_DIR/bin/$app"
+			ln -s /bin/busybox "$ROOT_DIR/bin/$app" 2>/dev/null || true
+		done
+	fi
+
+	cat > "$ROOT_DIR/standby-init" <<'EOF'
+#!/bin/sh
+set -eu
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/sbin
+: "${ETH_DEV:=eth0}"
+: "${LOG_DEVICE:=}"
+: "${LOG_FSTYPE:=auto}"
+: "${LOG_FILE:=lswxl-ramroot-standby.log}"
+: "${STANDBY_LOG_DEVICE_WAIT_SEC:=10}"
+: "${STANDBY_DIAGNOSTICS:=auto}"
+: "${WAKE_PORTS:=9 2304}"
+: "${WAKE_TIMEOUT:=300}"
+: "${STANDBY_SWITCH_POLL_SEC:=2}"
+: "${STANDBY_INPUT_EVENT:=/dev/input/event0}"
+: "${STANDBY_FAN_COOLDOWN_SEC:=120}"
+: "${STANDBY_STORAGE_MODE:=log}"
+: "${STANDBY_STORAGE_DISKS:=}"
+: "${STANDBY_STORAGE_SETTLE_SEC:=30}"
+: "${STANDBY_POWER_RAILS:=}"
+: "${STANDBY_POWER_RESTORE_DELAY_SEC:=8}"
+: "${STANDBY_POWER_RAIL_HDD0_DEV:=regulators:regulator@2}"
+: "${STANDBY_POWER_RAIL_HDD0_GPIO:=28}"
+: "${STANDBY_POWER_RAIL_HDD1_DEV:=regulators:regulator@3}"
+: "${STANDBY_POWER_RAIL_HDD1_GPIO:=29}"
+: "${STANDBY_POWER_RAIL_USB_DEV:=regulators:regulator@1}"
+: "${STANDBY_POWER_RAIL_USB_GPIO:=37}"
+LOG_SUSPENDED=0
+
+log_device_uuid()
+{
+	case "$LOG_DEVICE" in
+		/dev/disk/by-uuid/*) basename "$LOG_DEVICE" ;;
+		*) ;;
+	esac
+}
+
+find_log_device_by_uuid()
+{
+	uuid="$(log_device_uuid)"
+	[ -n "$uuid" ] || return 1
+	command -v blkid >/dev/null 2>&1 || return 1
+	for dev in /dev/sd*[0-9] /dev/sd*; do
+		[ -b "$dev" ] || continue
+		found="$(blkid -s UUID -o value "$dev" 2>/dev/null || true)"
+		[ "$found" = "$uuid" ] && {
+			echo "$dev"
+			return 0
+		}
+	done
+	return 1
+}
+
+resolve_log_device()
+{
+	[ -n "$LOG_DEVICE" ] || return 1
+	if [ -b "$LOG_DEVICE" ]; then
+		echo "$LOG_DEVICE"
+		return 0
+	fi
+	find_log_device_by_uuid
+}
+
+diagnostics_enabled()
+{
+	case "$STANDBY_DIAGNOSTICS" in
+		1|yes|true|on|always)
+			return 0
+			;;
+		0|no|false|off|never)
+			return 1
+			;;
+		auto|"")
+			resolve_log_device >/dev/null 2>&1
+			return $?
+			;;
+		*)
+			resolve_log_device >/dev/null 2>&1
+			return $?
+			;;
+	esac
+}
+
+log()
+{
+	echo "standby-init: $*"
+	write_log "$*"
+}
+
+write_log()
+{
+	[ -n "$LOG_DEVICE" ] || return 0
+	[ "${LOG_SUSPENDED:-0}" != 1 ] || return 0
+	log_dev="$(resolve_log_device 2>/dev/null || true)"
+	[ -b "$log_dev" ] || return 0
+	mkdir -p /log
+	if ! grep -qs ' /log ' /proc/mounts; then
+		case "$LOG_FSTYPE" in
+			auto|"") mount -o rw,sync "$log_dev" /log 2>/dev/null || return 0 ;;
+			*) mount -t "$LOG_FSTYPE" -o rw,sync "$log_dev" /log 2>/dev/null || return 0 ;;
+		esac
+	fi
+	printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo no-date)" "$*" >> "/log/$LOG_FILE" 2>/dev/null || true
+	sync "/log/$LOG_FILE" 2>/dev/null || sync
+}
+
+close_log()
+{
+	if grep -qs ' /log ' /proc/mounts; then
+		sync
+		umount /log 2>/dev/null || true
+	fi
+}
+
+wait_log_device()
+{
+	[ -n "$LOG_DEVICE" ] || return 0
+	case "$STANDBY_LOG_DEVICE_WAIT_SEC" in ''|*[!0-9]*) STANDBY_LOG_DEVICE_WAIT_SEC=10 ;; esac
+	[ "$STANDBY_LOG_DEVICE_WAIT_SEC" -gt 0 ] || return 0
+	i=0
+	while [ "$i" -lt "$STANDBY_LOG_DEVICE_WAIT_SEC" ]; do
+		log_dev="$(resolve_log_device 2>/dev/null || true)"
+		[ -n "$log_dev" ] && {
+			LOG_SUSPENDED=0
+			log "log device available after USB restore device=$log_dev configured=$LOG_DEVICE wait=${i}s"
+			return 0
+		}
+		sleep 1
+		i=$((i + 1))
+	done
+	LOG_SUSPENDED=0
+	log "log device still missing after USB restore device=$LOG_DEVICE wait=${STANDBY_LOG_DEVICE_WAIT_SEC}s"
+}
+
+show_status()
+{
+	log "pid=$$"
+	log "root=$(cat /proc/self/mountinfo 2>/dev/null | awk '$5 == \"/\" {print $0; exit}')"
+	log "mounts:"
+	sed -n '1,12p' /proc/mounts 2>/dev/null || true
+	log "network:"
+	ip addr show 2>/dev/null || true
+	log "processes:"
+	ps 2>/dev/null || true
+}
+
+switch_mode()
+{
+	mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+	line_on="$(grep 'Power-on Switch' /sys/kernel/debug/gpio 2>/dev/null || true)"
+	line_auto="$(grep 'Power-auto Switch' /sys/kernel/debug/gpio 2>/dev/null || true)"
+	case "$line_on" in *' lo '*) on_active=1 ;; *) on_active=0 ;; esac
+	case "$line_auto" in *' lo '*) auto_active=1 ;; *) auto_active=0 ;; esac
+
+	if [ "$on_active" -eq 1 ] && [ "$auto_active" -eq 0 ]; then
+		echo ON
+	elif [ "$on_active" -eq 0 ] && [ "$auto_active" -eq 1 ]; then
+		echo AUTO
+	elif [ "$on_active" -eq 0 ] && [ "$auto_active" -eq 0 ]; then
+		echo OFF
+	else
+		echo UNKNOWN
+	fi
+}
+
+show_oldroot()
+{
+	log "oldroot mounts:"
+	awk '$2 == "/oldroot" || index($2, "/oldroot/") == 1 { print }' /proc/mounts 2>/dev/null || true
+	log "oldroot block devices:"
+	for b in /sys/block/*; do
+		[ -e "$b" ] || continue
+		printf '%s -> ' "$b"
+		readlink -f "$b/device" 2>/dev/null || echo
+	done
+	log "oldroot mdstat:"
+	cat /proc/mdstat 2>/dev/null || true
+}
+
+release_oldroot_dry_run()
+{
+	log "release-oldroot dry-run entered"
+	show_oldroot
+	log "trying to unmount nested oldroot mounts in private namespace"
+	awk 'index($2, "/oldroot/") == 1 { print $2 }' /proc/mounts 2>/dev/null |
+		sort -r |
+		while read -r mpt; do
+			log "umount $mpt"
+			if ! umount "$mpt" 2>/dev/null; then
+				log "umount failed: $mpt"
+				log "lazy umount $mpt"
+				umount -l "$mpt" 2>/dev/null || log "lazy umount failed: $mpt"
+			fi
+		done
+	log "trying to unmount /oldroot in private namespace"
+	if ! umount /oldroot >/tmp/lswxl-umount-oldroot.log 2>&1; then
+		log "umount failed: /oldroot"
+		while IFS= read -r line; do log "umount-oldroot: $line"; done < /tmp/lswxl-umount-oldroot.log
+		log "trying read-only remount and lazy detach for /oldroot"
+		sync
+		mount -o remount,ro /oldroot >/tmp/lswxl-remount-oldroot.log 2>&1 || {
+			log "remount read-only failed: /oldroot"
+			while IFS= read -r line; do log "remount-oldroot: $line"; done < /tmp/lswxl-remount-oldroot.log
+		}
+		umount -l /oldroot >/tmp/lswxl-lazy-umount-oldroot.log 2>&1 || {
+			log "lazy umount failed: /oldroot"
+			while IFS= read -r line; do log "lazy-umount-oldroot: $line"; done < /tmp/lswxl-lazy-umount-oldroot.log
+		}
+	fi
+	log "remaining oldroot mounts:"
+	awk '$2 == "/oldroot" || index($2, "/oldroot/") == 1 { print }' /proc/mounts 2>/dev/null || true
+	log "release-oldroot dry-run complete"
+}
+
+fan_detect_polarity()
+{
+	if [ -r /proc/device-tree/gpio_fan/gpios ]; then
+		flag_byte="$(od -An -v -tu1 /proc/device-tree/gpio_fan/gpios 2>/dev/null | awk 'NR==1 {print $12; exit}')"
+		case "$flag_byte" in
+			1|3|5|7|9|11|13|15) echo inverted; return 0 ;;
+			0|2|4|6|8|10|12|14) echo normal; return 0 ;;
+		esac
+	fi
+	echo normal
+}
+
+fan_stop_value()
+{
+	case "$(fan_detect_polarity)" in
+		inverted) echo 5000 ;;
+		*) echo 0 ;;
+	esac
+}
+
+set_info_led()
+{
+	mode="$1"
+	led=/sys/class/leds/linkstation:amber:info
+	[ -d "$led" ] || return 0
+	case "$mode" in
+		entering)
+			echo timer > "$led/trigger" 2>/dev/null || true
+			echo 250 > "$led/delay_on" 2>/dev/null || true
+			echo 250 > "$led/delay_off" 2>/dev/null || true
+			;;
+		blink)
+			echo timer > "$led/trigger" 2>/dev/null || true
+			echo 1000 > "$led/delay_on" 2>/dev/null || true
+			echo 3000 > "$led/delay_off" 2>/dev/null || true
+			;;
+		on)
+			echo none > "$led/trigger" 2>/dev/null || true
+			echo 1 > "$led/brightness" 2>/dev/null || true
+			;;
+		off)
+			echo none > "$led/trigger" 2>/dev/null || true
+			echo 0 > "$led/brightness" 2>/dev/null || true
+			;;
+	esac
+}
+
+fan_stop()
+{
+	stop="$(fan_stop_value)"
+	for fan in /sys/devices/platform/gpio_fan/hwmon/hwmon*/fan1_target; do
+		[ -e "$fan" ] || continue
+		log "fan stop path=$fan value=$stop"
+		echo "$stop" > "$fan" 2>/dev/null || log "fan stop failed: $fan"
+	done
+}
+
+release_oldroot()
+{
+	log "release-oldroot entered"
+	if diagnostics_enabled; then
+		show_oldroot
+	else
+		log "oldroot diagnostics skipped"
+	fi
+	log "sync before oldroot release"
+	sync
+	log "unmounting nested oldroot mounts"
+	awk 'index($2, "/oldroot/") == 1 { print $2 }' /proc/mounts 2>/dev/null |
+		sort -r |
+		while read -r mpt; do
+			log "umount $mpt"
+			if ! umount "$mpt" 2>/dev/null; then
+				log "umount failed: $mpt"
+				log "lazy umount $mpt"
+				umount -l "$mpt" 2>/dev/null || log "lazy umount failed: $mpt"
+			fi
+		done
+	sync
+	log "unmounting /oldroot"
+	if diagnostics_enabled && command -v findmnt >/dev/null 2>&1; then
+		log "findmnt /oldroot before unmount:"
+		findmnt -R /oldroot 2>/dev/null || true
+	fi
+	if command -v /usr/bin/umount >/dev/null 2>&1; then
+		log "recursive util-linux umount /oldroot"
+		/usr/bin/umount -R /oldroot >/tmp/lswxl-umount-recursive.log 2>&1 || true
+		while IFS= read -r line; do log "umount-recursive: $line"; done < /tmp/lswxl-umount-recursive.log
+	fi
+	if ! umount /oldroot >/tmp/lswxl-umount-oldroot.log 2>&1; then
+		log "umount failed: /oldroot"
+		while IFS= read -r line; do log "umount-oldroot: $line"; done < /tmp/lswxl-umount-oldroot.log
+		log "trying read-only remount and lazy detach for /oldroot"
+		mount -o remount,ro /oldroot >/tmp/lswxl-remount-oldroot.log 2>&1 || {
+			log "remount read-only failed: /oldroot"
+			while IFS= read -r line; do log "remount-oldroot: $line"; done < /tmp/lswxl-remount-oldroot.log
+		}
+		umount -l /oldroot >/tmp/lswxl-lazy-umount-oldroot.log 2>&1 || {
+			log "lazy umount failed: /oldroot"
+			while IFS= read -r line; do log "lazy-umount-oldroot: $line"; done < /tmp/lswxl-lazy-umount-oldroot.log
+		}
+	fi
+	log "remaining oldroot mounts:"
+	awk '$2 == "/oldroot" || index($2, "/oldroot/") == 1 { print }' /proc/mounts 2>/dev/null || true
+	log "release-oldroot complete"
+}
+
+log_storage_state()
+{
+	stage="$1"
+	log "storage state stage=$stage mode=$STANDBY_STORAGE_MODE disks=${STANDBY_STORAGE_DISKS:-auto}"
+	log "storage mounts:"
+	cat /proc/mounts 2>/dev/null || true
+	log "storage mdstat:"
+	cat /proc/mdstat 2>/dev/null || true
+	for dev in /sys/block/md* /sys/block/sd*; do
+		[ -e "$dev" ] || continue
+		name="$(basename "$dev")"
+		log "block $name:"
+		for f in size ro removable stat queue/rotational device/state device/power/control power/control; do
+			[ -e "$dev/$f" ] || continue
+			log "block $name $f=$(cat "$dev/$f" 2>/dev/null || echo unknown)"
+		done
+		for rel in holders slaves; do
+			[ -d "$dev/$rel" ] || continue
+			items="$(cd "$dev/$rel" 2>/dev/null && echo * 2>/dev/null || true)"
+			[ "$items" = "*" ] && items=
+			log "block $name $rel=${items:-none}"
+		done
+	done
+}
+
+discover_sata_disks()
+{
+	for dev in /sys/block/sd*; do
+		[ -e "$dev" ] || continue
+		name="$(basename "$dev")"
+		path="$(readlink -f "$dev/device" 2>/dev/null || true)"
+		case "$path" in
+			*sata*|*ata[0-9]*)
+				[ -b "/dev/$name" ] && echo "/dev/$name"
+				;;
+		esac
+	done | sort
+}
+
+storage_disks()
+{
+	if [ -n "$STANDBY_STORAGE_DISKS" ]; then
+		printf '%s\n' $STANDBY_STORAGE_DISKS
+		return 0
+	fi
+	discover_sata_disks
+}
+
+log_process_refs()
+{
+	log "process refs:"
+	for p in /proc/[0-9]*; do
+		[ -d "$p" ] || continue
+		pid="${p##*/}"
+		comm="$(cat "$p/comm" 2>/dev/null || echo unknown)"
+		root="$(readlink "$p/root" 2>/dev/null || echo '?')"
+		cwd="$(readlink "$p/cwd" 2>/dev/null || echo '?')"
+		exe="$(readlink "$p/exe" 2>/dev/null || echo '?')"
+		case "$root $cwd $exe" in
+			*/oldroot*|*" (deleted)"*|*"?"*)
+				log "proc pid=$pid comm=$comm root=$root cwd=$cwd exe=$exe"
+				;;
+		esac
+		case "$pid" in
+			1|$$)
+				log "proc-key pid=$pid comm=$comm root=$root cwd=$cwd exe=$exe"
+				;;
+		esac
+		for fd in "$p"/fd/*; do
+			[ -e "$fd" ] || continue
+			target="$(readlink "$fd" 2>/dev/null || true)"
+			case "$target" in
+				*/oldroot*|*" (deleted)"*)
+					log "proc-fd pid=$pid comm=$comm fd=${fd##*/} target=$target"
+					;;
+			esac
+		done
+	done
+}
+
+storage_busy_names()
+{
+	for p in /proc/[0-9]*; do
+		[ -r "$p/comm" ] || continue
+		comm="$(cat "$p/comm" 2>/dev/null || true)"
+		case "$comm" in
+			jbd2/md*-*|ext4-rsv-conver|*ext4-rsv-conversion*|*flush-9:*)
+				echo "$comm"
+				;;
+		esac
+	done | sort
+}
+
+wait_storage_settle()
+{
+	case "$STANDBY_STORAGE_SETTLE_SEC" in ''|*[!0-9]*) STANDBY_STORAGE_SETTLE_SEC=30 ;; esac
+	[ "$STANDBY_STORAGE_SETTLE_SEC" -gt 0 ] || {
+		log "storage settle skipped"
+		return 0
+	}
+	i=0
+	while [ "$i" -lt "$STANDBY_STORAGE_SETTLE_SEC" ]; do
+		busy="$(storage_busy_names | tr '\n' ' ')"
+		if [ -z "$busy" ]; then
+			log "storage settle complete after ${i}s"
+			return 0
+		fi
+		log "storage settle ${i}s busy=$busy"
+		sleep 1
+		i=$((i + 1))
+	done
+	busy="$(storage_busy_names | tr '\n' ' ')"
+	log "storage settle timeout ${STANDBY_STORAGE_SETTLE_SEC}s busy=${busy:-none}"
+}
+
+stop_md_arrays()
+{
+	command -v mdadm >/dev/null 2>&1 || {
+		log "mdadm missing; cannot stop md arrays"
+		return 0
+	}
+	awk '/^md[0-9]+[[:space:]]*:/ {print "/dev/" $1}' /proc/mdstat 2>/dev/null |
+		sort -r |
+		while read -r md; do
+			[ -e "$md" ] || continue
+			if diagnostics_enabled; then
+				log_process_refs
+			else
+				log "process-ref diagnostics skipped before mdadm stop $md"
+			fi
+			if command -v blockdev >/dev/null 2>&1; then
+				log "blockdev setro $md"
+				blockdev --setro "$md" >/tmp/lswxl-blockdev-setro.log 2>&1 || true
+				while IFS= read -r line; do log "blockdev-setro: $line"; done < /tmp/lswxl-blockdev-setro.log
+			fi
+			log "mdadm stop $md"
+			mdadm --stop "$md" >/tmp/lswxl-mdadm-stop.log 2>&1 || true
+			while IFS= read -r line; do log "mdadm: $line"; done < /tmp/lswxl-mdadm-stop.log
+		done
+}
+
+standby_disks()
+{
+	disks="$(storage_disks | tr '\n' ' ')"
+	log "storage disks selected=${disks:-none}"
+	for disk in $disks; do
+		[ -b "$disk" ] || {
+			log "disk standby skipped missing=$disk"
+			continue
+		}
+		if command -v blockdev >/dev/null 2>&1; then
+			log "blockdev flushbufs $disk"
+			blockdev --flushbufs "$disk" >/tmp/lswxl-blockdev.log 2>&1 || true
+			while IFS= read -r line; do log "blockdev: $line"; done < /tmp/lswxl-blockdev.log
+		fi
+		if command -v hdparm >/dev/null 2>&1; then
+			log "hdparm standby $disk"
+			hdparm -y "$disk" >/tmp/lswxl-hdparm.log 2>&1 || true
+			while IFS= read -r line; do log "hdparm: $line"; done < /tmp/lswxl-hdparm.log
+		else
+			log "hdparm missing; cannot standby $disk"
+		fi
+	done
+}
+
+prepare_storage_standby()
+{
+	if diagnostics_enabled; then
+		log_storage_state before-storage
+	else
+		log "storage diagnostics skipped before-storage"
+	fi
+	wait_storage_settle
+	case "$STANDBY_STORAGE_MODE" in
+		log|"")
+			log "storage action: log only"
+			;;
+		standby)
+			standby_disks
+			;;
+		md-stop-standby)
+			stop_md_arrays
+			standby_disks
+			;;
+		*)
+			log "unknown storage mode=$STANDBY_STORAGE_MODE; log only"
+			;;
+	esac
+	if diagnostics_enabled; then
+		log_storage_state after-storage
+	else
+		log "storage diagnostics skipped after-storage"
+	fi
+}
+
+rail_gpio()
+{
+	case "$1" in
+		USB) echo "$STANDBY_POWER_RAIL_USB_GPIO" ;;
+		HDD0|HDD) echo "$STANDBY_POWER_RAIL_HDD0_GPIO" ;;
+		HDD1) echo "$STANDBY_POWER_RAIL_HDD1_GPIO" ;;
+		*) return 1 ;;
+	esac
+}
+
+rail_device()
+{
+	case "$1" in
+		USB) echo "$STANDBY_POWER_RAIL_USB_DEV" ;;
+		HDD0|HDD) echo "$STANDBY_POWER_RAIL_HDD0_DEV" ;;
+		HDD1) echo "$STANDBY_POWER_RAIL_HDD1_DEV" ;;
+		*) return 1 ;;
+	esac
+}
+
+rail_unbind()
+{
+	dev="$1"
+	[ -e "/sys/bus/platform/drivers/reg-fixed-voltage/$dev" ] || return 0
+	log "power rail unbind $dev"
+	echo "$dev" > /sys/bus/platform/drivers/reg-fixed-voltage/unbind 2>/tmp/lswxl-rail-unbind.log || true
+	while IFS= read -r line; do log "power rail unbind: $line"; done < /tmp/lswxl-rail-unbind.log
+}
+
+rail_bind()
+{
+	dev="$1"
+	[ ! -e "/sys/bus/platform/drivers/reg-fixed-voltage/$dev" ] || return 0
+	log "power rail bind $dev"
+	echo "$dev" > /sys/bus/platform/drivers/reg-fixed-voltage/bind 2>/tmp/lswxl-rail-bind.log || true
+	while IFS= read -r line; do log "power rail bind: $line"; done < /tmp/lswxl-rail-bind.log
+}
+
+rail_gpio_set()
+{
+	gpio="$1"
+	value="$2"
+	if [ ! -d "/sys/class/gpio/gpio$gpio" ]; then
+		echo "$gpio" > /sys/class/gpio/export 2>/tmp/lswxl-gpio-export.log || true
+		while IFS= read -r line; do log "gpio export $gpio: $line"; done < /tmp/lswxl-gpio-export.log
+	fi
+	[ -d "/sys/class/gpio/gpio$gpio" ] || {
+		log "gpio missing gpio=$gpio"
+		return 1
+	}
+	echo out > "/sys/class/gpio/gpio$gpio/direction" 2>/dev/null || true
+	echo "$value" > "/sys/class/gpio/gpio$gpio/value" 2>/tmp/lswxl-gpio-value.log || true
+	while IFS= read -r line; do log "gpio value $gpio: $line"; done < /tmp/lswxl-gpio-value.log
+	log "gpio set gpio=$gpio value=$(cat "/sys/class/gpio/gpio$gpio/value" 2>/dev/null || echo unknown)"
+}
+
+power_rail_on_one()
+{
+	rail="$1"
+	gpio="$(rail_gpio "$rail" 2>/dev/null || true)"
+	dev="$(rail_device "$rail" 2>/dev/null || true)"
+	if [ -z "$gpio" ] || [ -z "$dev" ]; then
+		log "power rail unknown rail=$rail"
+		return 1
+	fi
+	log "power rail on rail=$rail dev=$dev gpio=$gpio"
+	rail_gpio_set "$gpio" 1 || true
+	echo "$gpio" > /sys/class/gpio/unexport 2>/dev/null || true
+	rail_bind "$dev"
+	return 0
+}
+
+power_rail_off_one()
+{
+	rail="$1"
+	gpio="$(rail_gpio "$rail" 2>/dev/null || true)"
+	dev="$(rail_device "$rail" 2>/dev/null || true)"
+	if [ -z "$gpio" ] || [ -z "$dev" ]; then
+		log "power rail unknown rail=$rail"
+		return 1
+	fi
+	if [ "$rail" = USB ] && [ -n "$LOG_DEVICE" ]; then
+		log "closing USB log before USB rail off device=$LOG_DEVICE uuid=$(log_device_uuid)"
+		close_log
+		LOG_SUSPENDED=1
+	fi
+	log "power rail off rail=$rail dev=$dev gpio=$gpio"
+	rail_unbind "$dev"
+	rail_gpio_set "$gpio" 0 || true
+	return 0
+}
+
+is_usb_rail()
+{
+	[ "$1" = USB ]
+}
+
+power_rails_off()
+{
+	[ -n "$STANDBY_POWER_RAILS" ] || {
+		log "power rails off skipped"
+		return 0
+	}
+	for rail in $STANDBY_POWER_RAILS; do
+		is_usb_rail "$rail" && continue
+		power_rail_off_one "$rail" || true
+	done
+	for rail in $STANDBY_POWER_RAILS; do
+		is_usb_rail "$rail" || continue
+		power_rail_off_one "$rail" || true
+	done
+}
+
+power_rails_on()
+{
+	[ -n "$STANDBY_POWER_RAILS" ] || {
+		log "power rails on skipped"
+		return 0
+	}
+	usb_restored=0
+	for rail in $STANDBY_POWER_RAILS; do
+		is_usb_rail "$rail" && continue
+		power_rail_on_one "$rail" || true
+	done
+	for rail in $STANDBY_POWER_RAILS; do
+		is_usb_rail "$rail" || continue
+		power_rail_on_one "$rail" || true
+		usb_restored=1
+	done
+	if [ "$usb_restored" -eq 1 ]; then
+		wait_log_device
+	fi
+	case "$STANDBY_POWER_RESTORE_DELAY_SEC" in ''|*[!0-9]*) STANDBY_POWER_RESTORE_DELAY_SEC=8 ;; esac
+	if [ "$STANDBY_POWER_RESTORE_DELAY_SEC" -gt 0 ]; then
+		log "power rail restore delay ${STANDBY_POWER_RESTORE_DELAY_SEC}s"
+		sleep "$STANDBY_POWER_RESTORE_DELAY_SEC"
+	fi
+}
+
+wait_for_wake()
+{
+	mac="$(cat /sys/class/net/$ETH_DEV/address 2>/dev/null || true)"
+	if [ -z "$mac" ]; then
+		log "wake wait skipped: missing mac for $ETH_DEV"
+		return 2
+	fi
+	case "$STANDBY_FAN_COOLDOWN_SEC" in ''|*[!0-9]*) STANDBY_FAN_COOLDOWN_SEC=120 ;; esac
+	log "wake wait start mac=$mac timeout=$WAKE_TIMEOUT ports=$WAKE_PORTS switch_poll=$STANDBY_SWITCH_POLL_SEC fan_cooldown=$STANDBY_FAN_COOLDOWN_SEC"
+	elapsed=0
+	fan_stopped=0
+	if [ "$STANDBY_FAN_COOLDOWN_SEC" -eq 0 ]; then
+		log "fan cooldown disabled; stopping fan now"
+		fan_stop
+		fan_stopped=1
+	else
+		log "fan cooldown active ${STANDBY_FAN_COOLDOWN_SEC}s"
+	fi
+	poll_enabled=1
+	poll_interval="$STANDBY_SWITCH_POLL_SEC"
+	case "$poll_interval" in ''|*[!0-9]*) poll_interval=2 ;; esac
+	if [ "$poll_interval" -eq 0 ]; then
+		poll_enabled=0
+	elif [ "$poll_interval" -lt 1 ]; then
+		poll_interval=1
+	fi
+	while :; do
+		if [ "$fan_stopped" -eq 0 ] && [ "$elapsed" -ge "$STANDBY_FAN_COOLDOWN_SEC" ]; then
+			log "fan cooldown elapsed after ${elapsed}s; stopping fan"
+			fan_stop
+			fan_stopped=1
+		fi
+		if [ "$poll_enabled" -eq 1 ]; then
+			mode="$(switch_mode 2>/dev/null || echo UNKNOWN)"
+			if [ "$mode" != AUTO ]; then
+				log "switch changed mode=$mode; leaving standby"
+				return 0
+			fi
+		fi
+		if [ "$WAKE_TIMEOUT" != 0 ] && [ "$elapsed" -ge "$WAKE_TIMEOUT" ]; then
+			log "wake timeout rc=2"
+			return 2
+		fi
+		if [ "$poll_enabled" -eq 1 ]; then
+			slice="$poll_interval"
+		else
+			slice=0
+		fi
+		if [ "$WAKE_TIMEOUT" != 0 ]; then
+			remain=$((WAKE_TIMEOUT - elapsed))
+			if [ "$poll_enabled" -eq 0 ] || [ "$remain" -lt "$slice" ]; then
+				slice="$remain"
+			fi
+			[ "$slice" -lt 1 ] && slice=1
+		fi
+		if [ "$fan_stopped" -eq 0 ]; then
+			fan_remain=$((STANDBY_FAN_COOLDOWN_SEC - elapsed))
+			[ "$fan_remain" -lt 1 ] && fan_remain=1
+			if [ "$slice" -eq 0 ] || [ "$fan_remain" -lt "$slice" ]; then
+				slice="$fan_remain"
+			fi
+		fi
+		if command -v lswxl-wait-wake-switch >/dev/null 2>&1 && [ -r "$STANDBY_INPUT_EVENT" ]; then
+			set +e
+			lswxl-wait-wake-switch wait "$mac" "$slice" "$STANDBY_INPUT_EVENT" $WAKE_PORTS >/tmp/lswxl-wake-event.log 2>&1
+			rc=$?
+			set -e
+			while IFS= read -r line; do
+				log "event-helper: $line"
+			done < /tmp/lswxl-wake-event.log
+		elif ! command -v lswxl-ramroot-wait-wake >/dev/null 2>&1; then
+			log "wake helper missing; fallback sleep slice=$slice"
+			sleep "$slice"
+			rc=2
+		else
+			set +e
+			lswxl-ramroot-wait-wake "$mac" "$slice" $WAKE_PORTS
+			rc=$?
+			set -e
+		fi
+		case "$rc" in
+			0) log "wake received rc=$rc"; return 0 ;;
+			3)
+				mode="$(switch_mode 2>/dev/null || echo UNKNOWN)"
+				log "switch event rc=$rc mode=$mode"
+				[ "$mode" != AUTO ] && return 0
+				;;
+			2) ;;
+			*) log "wake helper rc=$rc"; return "$rc" ;;
+		esac
+		elapsed=$((elapsed + slice))
+	done
+}
+
+standby()
+{
+	log "standby entered wake_timeout=$WAKE_TIMEOUT wake_ports=$WAKE_PORTS"
+	set_info_led entering
+	if diagnostics_enabled; then
+		show_status
+	else
+		log "status diagnostics skipped"
+	fi
+	release_oldroot
+	prepare_storage_standby
+	power_rails_off
+	log "setting standby indicators"
+	set_info_led blink
+	wait_for_wake || true
+	power_rails_on
+	log "handoff indicators: info led solid, final sync"
+	set_info_led on
+	sync
+	close_log
+}
+
+hardware_dry_run()
+{
+	log "hardware dry-run entered"
+	log "fan polarity=$(fan_detect_polarity) stop_value=$(fan_stop_value)"
+	for fan in /sys/devices/platform/gpio_fan/hwmon/hwmon*/fan1_target; do
+		[ -e "$fan" ] || continue
+		log "fan target path=$fan current=$(cat "$fan" 2>/dev/null || echo unknown)"
+	done
+	for led in /sys/class/leds/*; do
+		[ -e "$led" ] || continue
+		log "led=$(basename "$led") trigger=$(cat "$led/trigger" 2>/dev/null || echo unknown) brightness=$(cat "$led/brightness" 2>/dev/null || echo unknown)"
+	done
+	log "$ETH_DEV mac=$(cat /sys/class/net/$ETH_DEV/address 2>/dev/null || echo unknown)"
+	if command -v lswxl-ramroot-wait-wake >/dev/null 2>&1; then
+		log "wake helper=$(command -v lswxl-ramroot-wait-wake)"
+		set +e
+		lswxl-ramroot-wait-wake "$(cat /sys/class/net/$ETH_DEV/address)" 1 9 2304 >/dev/null 2>&1
+		rc=$?
+		set -e
+		log "wake helper timeout test rc=$rc"
+	else
+		log "wake helper missing"
+	fi
+	log "hardware dry-run complete"
+	close_log
+}
+
+case "${1:-dry-run}" in
+	dry-run)
+		log "dry-run entered"
+		show_status
+		log "dry-run complete"
+		;;
+	analyze-oldroot)
+		log "analyze-oldroot entered"
+		show_status
+		show_oldroot
+		log "analyze-oldroot complete"
+		;;
+	release-oldroot-dry-run)
+		release_oldroot_dry_run
+		;;
+	hardware-dry-run)
+		hardware_dry_run
+		;;
+	standby|timed-standby)
+		standby
+		;;
+	*)
+		log "unknown mode: ${1:-}"
+		exit 2
+		;;
+esac
+EOF
+	chmod 755 "$ROOT_DIR/standby-init"
+
+	log "built RAM-root tree at $ROOT_DIR root_as_mount=$root_as_mount"
+	find "$ROOT_DIR" -maxdepth 3 -type f -o -type l | sort
+}
+
+mount_api()
+{
+	need_root
+	[ -d "$ROOT_DIR" ] || build_root
+	mountpoint -q "$ROOT_DIR/proc" 2>/dev/null || mount -t proc proc "$ROOT_DIR/proc"
+	mountpoint -q "$ROOT_DIR/sys" 2>/dev/null || mount -t sysfs sysfs "$ROOT_DIR/sys"
+	mountpoint -q "$ROOT_DIR/dev" 2>/dev/null || mount --bind /dev "$ROOT_DIR/dev"
+	mountpoint -q "$ROOT_DIR/run" 2>/dev/null || mount -t tmpfs -o rw,nosuid,nodev,mode=755,size=8m tmpfs "$ROOT_DIR/run"
+}
+
+umount_api()
+{
+	umount "$ROOT_DIR/run" 2>/dev/null || true
+	umount "$ROOT_DIR/dev" 2>/dev/null || true
+	umount "$ROOT_DIR/sys" 2>/dev/null || true
+	umount "$ROOT_DIR/proc" 2>/dev/null || true
+}
+
+test_root()
+{
+	need_root
+	[ -x "$ROOT_DIR/bin/sh" ] || build_root
+	mount_api
+	chroot "$ROOT_DIR" /standby-init dry-run
+	umount_api
+}
+
+write_pivot_test_script()
+{
+	mode="${1:-dry-run}"
+	cat > "$ROOT_DIR/pivot-test.sh" <<EOF
+#!/bin/sh
+set -eu
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ROOT_DIR='$ROOT_DIR'
+export ETH_DEV='$ETH_DEV'
+export LOG_DEVICE='$LOG_DEVICE'
+export LOG_FSTYPE='$LOG_FSTYPE'
+export LOG_FILE='$LOG_FILE'
+export STANDBY_LOG_DEVICE_WAIT_SEC='$STANDBY_LOG_DEVICE_WAIT_SEC'
+export STANDBY_DIAGNOSTICS='$STANDBY_DIAGNOSTICS'
+export WAKE_PORTS='$WAKE_PORTS'
+export WAKE_TIMEOUT='$WAKE_TIMEOUT'
+export STANDBY_SWITCH_POLL_SEC='$STANDBY_SWITCH_POLL_SEC'
+export STANDBY_INPUT_EVENT='$STANDBY_INPUT_EVENT'
+export STANDBY_FAN_COOLDOWN_SEC='$STANDBY_FAN_COOLDOWN_SEC'
+export STANDBY_STORAGE_MODE='$STANDBY_STORAGE_MODE'
+export STANDBY_STORAGE_DISKS='$STANDBY_STORAGE_DISKS'
+
+echo "pivot-test: before pivot"
+findmnt "\$ROOT_DIR" -o TARGET,FSTYPE,OPTIONS -n || true
+mount --make-rprivate / 2>/dev/null || true
+mount -t proc proc "\$ROOT_DIR/proc"
+mount -t sysfs sysfs "\$ROOT_DIR/sys"
+mount --bind /dev "\$ROOT_DIR/dev"
+mount -t tmpfs -o rw,nosuid,nodev,mode=755,size=8m tmpfs "\$ROOT_DIR/run"
+cd "\$ROOT_DIR"
+pivot_root . oldroot
+cd /
+echo "pivot-test: after pivot"
+/standby-init '$mode'
+echo "pivot-test: complete"
+EOF
+	chmod 755 "$ROOT_DIR/pivot-test.sh"
+}
+
+test_pivot()
+{
+	need_root
+	command -v unshare >/dev/null 2>&1 || fail "missing unshare"
+	command -v pivot_root >/dev/null 2>&1 || fail "missing pivot_root"
+	[ -x "$ROOT_DIR/standby-init" ] || build_root
+	mode="${1:-dry-run}"
+	write_pivot_test_script "$mode"
+	unshare -m /bin/sh "$ROOT_DIR/pivot-test.sh"
+}
+
+write_real_standby_script()
+{
+	mode="${1:-standby}"
+cat > "$ROOT_DIR/real-standby.sh" <<EOF
+#!/bin/sh
+set -eux
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ROOT_DIR='$ROOT_DIR'
+export ETH_DEV='$ETH_DEV'
+export LOG_DEVICE='$LOG_DEVICE'
+export LOG_FSTYPE='$LOG_FSTYPE'
+export LOG_FILE='$LOG_FILE'
+export STANDBY_LOG_DEVICE_WAIT_SEC='$STANDBY_LOG_DEVICE_WAIT_SEC'
+export STANDBY_DIAGNOSTICS='$STANDBY_DIAGNOSTICS'
+export WAKE_PORTS='$WAKE_PORTS'
+export WAKE_TIMEOUT='$WAKE_TIMEOUT'
+export STANDBY_SWITCH_POLL_SEC='$STANDBY_SWITCH_POLL_SEC'
+export STANDBY_FAN_COOLDOWN_SEC='$STANDBY_FAN_COOLDOWN_SEC'
+
+echo "real-standby: before pivot" > /dev/kmsg 2>/dev/null || true
+mount --make-rprivate / 2>/dev/null || true
+mount -o remount,exec /run 2>/dev/null || true
+mountpoint -q "\$ROOT_DIR" 2>/dev/null || mount --bind "\$ROOT_DIR" "\$ROOT_DIR"
+mount -o remount,bind,exec "\$ROOT_DIR" 2>/dev/null || true
+mount -t proc proc "\$ROOT_DIR/proc"
+mount -t sysfs sysfs "\$ROOT_DIR/sys"
+mount --bind /dev "\$ROOT_DIR/dev"
+mount -t tmpfs -o rw,nosuid,nodev,mode=755,size=8m tmpfs "\$ROOT_DIR/run"
+cd "\$ROOT_DIR"
+pivot_root . oldroot
+cd /
+echo "real-standby: after pivot" > /dev/kmsg 2>/dev/null || true
+exec /bin/sh /standby-init '$mode'
+EOF
+	chmod 755 "$ROOT_DIR/real-standby.sh"
+}
+
+enter_real_standby()
+{
+	need_root
+	[ -x "$ROOT_DIR/standby-init" ] || build_root
+	write_real_standby_script standby
+	/bin/sh "$ROOT_DIR/real-standby.sh"
+}
+
+clean()
+{
+	need_root
+	umount_api
+	if mountpoint -q "$ROOT_DIR" 2>/dev/null; then
+		umount "$ROOT_DIR"
+	fi
+	rm -rf "$RUN_DIR"
+	rm -f "$REQUEST_DEV_FILE" "$ENV_DEV_FILE"
+	if [ -e "$EXITRD_DIR/.lswxl-ramroot-standby" ]; then
+		rm -rf "$EXITRD_DIR"
+	fi
+	log "removed $RUN_DIR"
+}
+
+case "${1:-}" in
+	check) check ;;
+	status) status ;;
+	build-root) build_root ;;
+	test-root) test_root ;;
+	test-pivot) test_pivot "${2:-dry-run}" ;;
+	test-release-oldroot) test_pivot release-oldroot-dry-run ;;
+	test-hardware) test_pivot hardware-dry-run ;;
+	prepare-standby|prepare-exitrd-timed-standby)
+		prepare_standby
+		;;
+	enter-standby|enter-exitrd-timed-standby)
+		prepare_standby
+		systemctl poweroff
+		;;
+	enter-real-standby)
+		enter_real_standby
+		;;
+	clean) clean ;;
+	*)
+		cat <<'EOF'
+Usage:
+  lswxl-ramroot-standby check
+  lswxl-ramroot-standby status
+  lswxl-ramroot-standby build-root
+  lswxl-ramroot-standby test-root
+  lswxl-ramroot-standby test-pivot [dry-run|analyze-oldroot]
+  lswxl-ramroot-standby test-release-oldroot
+  lswxl-ramroot-standby test-hardware
+  lswxl-ramroot-standby prepare-standby
+  lswxl-ramroot-standby enter-standby
+  lswxl-ramroot-standby clean
+EOF
+		exit 2
+		;;
+esac

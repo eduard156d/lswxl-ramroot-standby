@@ -1,0 +1,20 @@
+# Local test artifacts
+*.log
+*.tmp
+*.bak
+*.bak.*
+
+# Build outputs
+*.o
+lswxl-wait-wake-switch
+
+# Archives generated for transfer/testing
+*.tar
+*.tar.gz
+*.tgz
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+

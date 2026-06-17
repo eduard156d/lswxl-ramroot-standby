@@ -1,0 +1,241 @@
+# LS-WXL RAM-Root Standby
+
+Experimental third standby approach for Buffalo LinkStation LS-WXL/LS-WSXL
+running Debian.
+
+> [!WARNING]
+> This project controls late shutdown, disks, fans, LEDs, GPIOs, and board
+> power rails on old Buffalo NAS hardware. A wrong configuration can make the
+> system fail to boot, cut power to the wrong device, or risk data loss. Test
+> only with verified backups and physical access to the machine.
+
+This package implements the current RAM-root/exitrd standby approach. It starts
+from the original Buffalo firmware design:
+
+1. let Debian/systemd reach a very late shutdown state
+2. create a tiny RAM root filesystem
+3. switch into that RAM root
+4. release the real root filesystem and disks
+5. stop fan/HDD/USB hardware as needed
+6. wait for a Wake-on-LAN magic packet
+7. continue to poweroff, letting AUTO mode boot the NAS cleanly
+
+The key design goal is that the internal HDD is not powered down while it is
+still the active root filesystem.
+
+## Current Status
+
+Experimental dry-run, hardware-inspection, and Wake-on-LAN RAM-root standby
+phase.
+
+Installed command:
+
+```sh
+/usr/local/sbin/lswxl-ramroot-standby
+```
+
+Supported commands:
+
+```sh
+lswxl-ramroot-standby check
+lswxl-ramroot-standby status
+lswxl-ramroot-standby build-root
+lswxl-ramroot-standby test-root
+lswxl-ramroot-standby test-pivot
+lswxl-ramroot-standby test-release-oldroot
+lswxl-ramroot-standby test-hardware
+lswxl-ramroot-standby prepare-standby
+lswxl-ramroot-standby enter-standby
+lswxl-ramroot-standby clean
+```
+
+The `test-*` commands use a private mount namespace and do not replace the
+running system root.
+
+For real standby waits, use `enter-standby`. It prepares
+`/run/initramfs/shutdown`, which is systemd's supported late shutdown handoff
+mechanism. The standby wait uses `WAKE_TIMEOUT`: `0` means wait indefinitely,
+non-zero values are test timeouts in seconds.
+
+Verified on one Buffalo LS-WXL test system running Debian GNU/Linux 12
+(bookworm), kernel `6.1.174`, architecture `armv5tel`:
+
+- `WAKE_TIMEOUT=300` times out cleanly when no packet is sent.
+- Sending a UDP magic packet to ports `9`/`2304` wakes the exitrd wait and logs
+  `wake received rc=0`.
+
+## Optional USB Logging
+
+The RAM-root logger can append diagnostic messages to an external block device.
+This is useful because journald is usually already stopped during
+`systemd-shutdown`.
+
+Configure `/etc/default/lswxl-ramroot-standby`:
+
+```sh
+LOG_DEVICE=/dev/disk/by-uuid/YOUR-USB-LOG-UUID
+LOG_FSTYPE=auto
+LOG_FILE=lswxl-ramroot-standby.log
+STANDBY_LOG_DEVICE_WAIT_SEC=10
+STANDBY_DIAGNOSTICS=auto
+WAKE_TIMEOUT=300
+STANDBY_ALLOWED_SWITCH=AUTO
+STANDBY_SWITCH_POLL_SEC=2
+STANDBY_FAN_COOLDOWN_SEC=120
+```
+
+Leave `LOG_DEVICE` empty to disable external logging. The logger mounts the
+device only while it writes and continues silently if the device is missing.
+`STANDBY_DIAGNOSTICS` controls expensive diagnostic-only probes such as full
+mount lists, oldroot block snapshots, storage state dumps, and process
+reference scans. The default `auto` runs those probes only when `LOG_DEVICE` is
+configured and currently available. Set it to `1` to force diagnostics or `0`
+to skip them. Safety-critical actions such as sync, oldroot unmount attempts,
+storage settle, mdadm, hdparm, rail control, fan control, and wake handling are
+not disabled by this setting.
+When `USB` is also listed in `STANDBY_POWER_RAILS`, the helper closes and
+unmounts the log before USB poweroff. After USB power restore it waits up to
+`STANDBY_LOG_DEVICE_WAIT_SEC` seconds for `LOG_DEVICE` to reappear. This wait
+is skipped completely when `LOG_DEVICE` is empty. The rail order is fixed:
+HDD/SATA rails are switched before the USB rail, both when powering off and
+when restoring power. If USB was powered off, HDD rail restore messages cannot
+be written to the USB log; keep USB out of `STANDBY_POWER_RAILS` for diagnostic
+runs that need those messages. If `/dev/disk/by-uuid/...` is not recreated in
+the RAM-root environment, the helper uses `blkid` to scan visible block devices
+for the configured UUID.
+
+`enter-standby` checks the physical switch before preparing the exitrd. By
+default standby is allowed only when the switch is in `AUTO`. During standby,
+the exitrd wait checks the switch every `STANDBY_SWITCH_POLL_SEC` seconds. A
+change to `ON` or `OFF` leaves standby and hands control to the final poweroff
+path; with the physical switch at `ON` the box is expected to boot again, while
+`OFF` should leave it off.
+
+## FAN Cooldown
+
+The fan does not have to stop at the exact moment standby starts. Configure
+`STANDBY_FAN_COOLDOWN_SEC` to keep it running for a short cooldown period after
+storage handling and rail poweroff have completed:
+
+```sh
+# Package default.
+STANDBY_FAN_COOLDOWN_SEC=120
+
+# Shorter hardware test.
+STANDBY_FAN_COOLDOWN_SEC=60
+
+# Stop the fan immediately when the standby wait starts.
+STANDBY_FAN_COOLDOWN_SEC=0
+```
+
+The cooldown is part of the wake wait loop. It does not block wake: a magic
+packet or physical switch change leaves standby immediately even while the fan
+is still in its cooldown window.
+
+During standby entry, while storage and rails are still being prepared, the
+helper sets `linkstation:amber:info` to a fast `250ms/250ms` blink pattern.
+During the actual standby wait it switches to a slower `1000ms/3000ms` pattern.
+The fast pattern overlaps visually with `lsmonitor` busy/wake, but `lsmonitor`
+is already out of the way during the late shutdown/RAM-root phase.
+
+## Storage And Power Rails
+
+The standby helper has two separate storage-related steps:
+
+1. Select block devices and put disks into ATA standby.
+2. Optionally switch board power rails off while waiting for wake.
+
+`STANDBY_STORAGE_DISKS` controls step 1.
+
+```sh
+# Auto-detect all visible SATA disks at standby runtime.
+STANDBY_STORAGE_DISKS=
+
+# Or force an explicit list.
+STANDBY_STORAGE_DISKS="/dev/sda /dev/sdb"
+```
+
+When the variable is empty, the RAM-root helper scans `/sys/block/sd*/device`
+and selects only SATA/ATA disks. USB disks are skipped, which allows a USB log
+stick to remain online.
+
+`STANDBY_POWER_RAILS` controls step 2.
+
+```sh
+# Disabled by default.
+STANDBY_POWER_RAILS=
+
+# Tested LS-WXL example.
+STANDBY_POWER_RAILS="HDD0 HDD1"
+
+# Productive target after USB rail validation.
+STANDBY_POWER_RAILS="HDD0 HDD1 USB"
+```
+
+Power rails are board-specific. Do not enable them blindly on another model.
+The order in `STANDBY_POWER_RAILS` is not used as execution order: the helper
+always handles HDD/SATA rails before USB to keep test and production behavior
+consistent.
+The short names are mapped through configurable variables:
+
+```sh
+STANDBY_POWER_RAIL_HDD0_DEV=regulators:regulator@2
+STANDBY_POWER_RAIL_HDD0_GPIO=28
+STANDBY_POWER_RAIL_HDD1_DEV=regulators:regulator@3
+STANDBY_POWER_RAIL_HDD1_GPIO=29
+STANDBY_POWER_RAIL_USB_DEV=regulators:regulator@1
+STANDBY_POWER_RAIL_USB_GPIO=37
+```
+
+On the tested LS-WXL, this mapping was discovered from the local Device Tree
+and sysfs:
+
+```sh
+for r in /sys/class/regulator/regulator.*; do
+    echo "== $r =="
+    cat "$r/name" 2>/dev/null
+    cat "$r/state" 2>/dev/null
+done
+
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+cat /sys/kernel/debug/gpio | grep 'regulators:regulator'
+```
+
+Expected LS-WXL-style output:
+
+```text
+USB Power
+HDD0 Power
+HDD1 Power
+
+gpio-28  (regulators:regulator) out hi
+gpio-29  (regulators:regulator) out hi
+gpio-37  (regulators:regulator) out hi
+```
+
+The Device Tree names can also be inspected directly:
+
+```sh
+find /proc/device-tree/regulators -maxdepth 2 -type f -print |
+while read f; do
+    printf '%s=' "$f"
+    tr -d '\000' < "$f" 2>/dev/null || od -An -tx1 -v "$f"
+    echo
+done
+```
+
+The helper switches a rail by temporarily unbinding the `reg-fixed-voltage`
+platform device, exporting the GPIO, setting it low for standby, setting it
+high on wake, and binding the regulator again. This has been verified on one
+LS-WXL test system for USB, HDD0, and HDD1.
+
+## Acknowledgements
+
+This project was developed and tested on a Buffalo LS-WXL running Debian
+GNU/Linux 12 (bookworm), installed with guidance from
+[1000001101000/Debian_on_Buffalo](https://github.com/1000001101000/Debian_on_Buffalo).
+No code from that repository is included here.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
