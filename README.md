@@ -35,6 +35,17 @@ This standby project is separate from Debian_on_Buffalo. It is meant as an
 optional add-on for users who already have Debian running on compatible Buffalo
 hardware and want to experiment with late-shutdown standby behavior.
 
+For normal booted-system hardware monitoring, fan control, LED handling, and
+physical switch handling, see the related `lswxl-hw-monitor` project:
+
+https://github.com/eduard156d/lswxl-hw-monitor
+
+The two projects intentionally stay separate:
+
+- `lswxl-hw-monitor` runs during normal Debian operation.
+- `lswxl-ramroot-standby` runs only during the late shutdown/RAM-root standby
+  phase.
+
 ## Current Status
 
 Experimental dry-run, hardware-inspection, and Wake-on-LAN RAM-root standby
