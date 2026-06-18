@@ -103,33 +103,23 @@ Supported commands:
 
 Command overview:
 
-- `/usr/local/sbin/lswxl-ramroot-standby check` checks the local installation,
-  important paths, helper binaries, and basic configuration. It does not enter
-  standby.
-- `/usr/local/sbin/lswxl-ramroot-standby status` prints current configuration
-  and detected hardware/control paths.
-- `/usr/local/sbin/lswxl-ramroot-standby build-root` builds the small RAM-root
-  tree below `/run/lswxl-ramroot-standby`.
-- `/usr/local/sbin/lswxl-ramroot-standby test-root` verifies that the RAM-root
-  contains the expected files and helper binaries.
-- `/usr/local/sbin/lswxl-ramroot-standby test-pivot` tests the pivot/chroot
-  path in a private mount namespace.
-- `/usr/local/sbin/lswxl-ramroot-standby test-release-oldroot` tests the
-  old-root release logic in a private mount namespace.
-- `/usr/local/sbin/lswxl-ramroot-standby test-hardware` exercises visible
-  hardware control paths such as fan, LEDs, storage, switch, and configured
-  rails without starting a real standby wait.
-- `/usr/local/sbin/lswxl-ramroot-standby prepare-standby` installs the
-  systemd exitrd handoff at `/run/initramfs/shutdown`. The standby logic will
-  run during the next shutdown.
-- `/usr/local/sbin/lswxl-ramroot-standby enter-standby` prepares the exitrd
-  handoff and immediately starts a normal shutdown. This is the command for a
-  real standby test.
-- `/usr/local/sbin/lswxl-ramroot-standby clean` removes the generated RAM-root
-  and standby handoff files from `/run`.
+| Command | What it does | When to use it |
+| --- | --- | --- |
+| `/usr/local/sbin/lswxl-ramroot-standby check` | Checks whether the installation is complete enough to run: required programs, helper binaries, configuration file, important paths, and basic hardware-control files. It does not build a new RAM root, does not install a shutdown hook, and does not enter standby. | Run this after installation or after changing the configuration. It is the safest first sanity check. |
+| `/usr/local/sbin/lswxl-ramroot-standby status` | Prints the currently loaded configuration and detected runtime state, for example switch handling, wake ports, storage mode, fan/LED paths, log device settings, and configured power rails. It is read-only. | Use this when you want to see what the standby script would currently use before running a test. |
+| `/usr/local/sbin/lswxl-ramroot-standby build-root` | Builds the temporary RAM-root tree below `/run/lswxl-ramroot-standby`. This copies the needed shell, BusyBox tools, helper binary, configuration, and scripts into a tiny filesystem that can run after the normal root filesystem is released. | Use this to prepare or inspect the RAM-root content without shutting down. This is also done automatically by the real standby path. |
+| `/usr/local/sbin/lswxl-ramroot-standby test-root` | Builds/checks the RAM-root and verifies that the expected files and helper binaries are present and executable. It does not pivot into the RAM root. | Use this after code changes or installation changes to confirm that the generated RAM-root is internally complete. |
+| `/usr/local/sbin/lswxl-ramroot-standby test-pivot` | Tests whether the script can enter the RAM-root environment using a private mount namespace. The running system root is not replaced globally. | Use this during development to validate the RAM-root handoff mechanics before trying a real shutdown/standby cycle. |
+| `/usr/local/sbin/lswxl-ramroot-standby test-release-oldroot` | Tests the logic that would later release the old root filesystem from inside the RAM-root phase. It runs in a private mount namespace where applicable, so it does not detach the real running root of the live system. | Use this when changing mount, pivot, oldroot, or release logic. It helps catch obvious problems before a real standby run. |
+| `/usr/local/sbin/lswxl-ramroot-standby test-hardware` | Probes and exercises visible hardware-control paths such as fan, LEDs, switch input, storage detection, and configured regulator/power-rail mappings. It does not start the real standby wait. | Use this after changing hardware-related config such as fan polarity, LED paths, storage selection, or rail mappings. Because it touches hardware controls, run it only with physical access. |
+| `/usr/local/sbin/lswxl-ramroot-standby prepare-standby` | Builds the RAM root and installs the systemd exitrd handoff at `/run/initramfs/shutdown`. Nothing shuts down immediately. The standby code will run during the next normal shutdown. | Use this when another command or service should trigger the actual shutdown later. This is a two-step variant: prepare first, then shut down separately. |
+| `/usr/local/sbin/lswxl-ramroot-standby enter-standby` | Builds the RAM root, installs the systemd exitrd handoff, and immediately starts a normal shutdown. During late shutdown, systemd hands over to the RAM-root standby logic, which releases storage, handles fan/LED/rails, waits for Wake-on-LAN or switch change, and then continues to final poweroff. | Use this for a real standby test or normal standby entry. This is the main operational command. |
+| `/usr/local/sbin/lswxl-ramroot-standby clean` | Removes generated runtime files below `/run`, including the generated RAM-root tree and the prepared `/run/initramfs/shutdown` handoff if present. It does not uninstall the package. | Use this to reset a prepared-but-not-yet-used standby setup, or after development tests when you want to remove temporary runtime state. |
 
 The `test-*` commands use a private mount namespace where applicable and do
-not replace the running system root.
+not replace the running system root. `prepare-standby` and `enter-standby` are
+the commands that install the real shutdown handoff; `enter-standby` also
+starts the shutdown immediately.
 
 For real standby waits, use `enter-standby`. It prepares
 `/run/initramfs/shutdown`, which is systemd's supported late shutdown handoff
