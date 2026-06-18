@@ -23,6 +23,18 @@ from the original Buffalo firmware design:
 The key design goal is that the internal HDD is not powered down while it is
 still the active root filesystem.
 
+## Related Projects
+
+This project is intended for Buffalo LS-WXL/LS-WSXL systems running Debian. The
+test system used during development was installed using the excellent
+Debian_on_Buffalo project:
+
+https://github.com/1000001101000/Debian_on_Buffalo
+
+This standby project is separate from Debian_on_Buffalo. It is meant as an
+optional add-on for users who already have Debian running on compatible Buffalo
+hardware and want to experiment with late-shutdown standby behavior.
+
 ## Current Status
 
 Experimental dry-run, hardware-inspection, and Wake-on-LAN RAM-root standby
