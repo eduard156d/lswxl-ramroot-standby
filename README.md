@@ -72,23 +72,64 @@ CC=gcc ./install.sh
 After installation, review `/etc/default/lswxl-ramroot-standby` carefully before
 enabling power rails or running a real standby test.
 
+The main command is installed below `/usr/local/sbin` and must be run with root
+privileges. On many Debian systems, `/usr/local/sbin` is not in a normal user's
+`PATH`, so use the full path and either `sudo` or a root shell.
+
+Examples:
+
+```sh
+sudo /usr/local/sbin/lswxl-ramroot-standby status
+
+# Or open a root shell first:
+su -
+/usr/local/sbin/lswxl-ramroot-standby status
+```
+
 Supported commands:
 
 ```sh
-lswxl-ramroot-standby check
-lswxl-ramroot-standby status
-lswxl-ramroot-standby build-root
-lswxl-ramroot-standby test-root
-lswxl-ramroot-standby test-pivot
-lswxl-ramroot-standby test-release-oldroot
-lswxl-ramroot-standby test-hardware
-lswxl-ramroot-standby prepare-standby
-lswxl-ramroot-standby enter-standby
-lswxl-ramroot-standby clean
+/usr/local/sbin/lswxl-ramroot-standby check
+/usr/local/sbin/lswxl-ramroot-standby status
+/usr/local/sbin/lswxl-ramroot-standby build-root
+/usr/local/sbin/lswxl-ramroot-standby test-root
+/usr/local/sbin/lswxl-ramroot-standby test-pivot
+/usr/local/sbin/lswxl-ramroot-standby test-release-oldroot
+/usr/local/sbin/lswxl-ramroot-standby test-hardware
+/usr/local/sbin/lswxl-ramroot-standby prepare-standby
+/usr/local/sbin/lswxl-ramroot-standby enter-standby
+/usr/local/sbin/lswxl-ramroot-standby clean
 ```
 
-The `test-*` commands use a private mount namespace and do not replace the
-running system root.
+Command overview:
+
+- `/usr/local/sbin/lswxl-ramroot-standby check` checks the local installation,
+  important paths, helper binaries, and basic configuration. It does not enter
+  standby.
+- `/usr/local/sbin/lswxl-ramroot-standby status` prints current configuration
+  and detected hardware/control paths.
+- `/usr/local/sbin/lswxl-ramroot-standby build-root` builds the small RAM-root
+  tree below `/run/lswxl-ramroot-standby`.
+- `/usr/local/sbin/lswxl-ramroot-standby test-root` verifies that the RAM-root
+  contains the expected files and helper binaries.
+- `/usr/local/sbin/lswxl-ramroot-standby test-pivot` tests the pivot/chroot
+  path in a private mount namespace.
+- `/usr/local/sbin/lswxl-ramroot-standby test-release-oldroot` tests the
+  old-root release logic in a private mount namespace.
+- `/usr/local/sbin/lswxl-ramroot-standby test-hardware` exercises visible
+  hardware control paths such as fan, LEDs, storage, switch, and configured
+  rails without starting a real standby wait.
+- `/usr/local/sbin/lswxl-ramroot-standby prepare-standby` installs the
+  systemd exitrd handoff at `/run/initramfs/shutdown`. The standby logic will
+  run during the next shutdown.
+- `/usr/local/sbin/lswxl-ramroot-standby enter-standby` prepares the exitrd
+  handoff and immediately starts a normal shutdown. This is the command for a
+  real standby test.
+- `/usr/local/sbin/lswxl-ramroot-standby clean` removes the generated RAM-root
+  and standby handoff files from `/run`.
+
+The `test-*` commands use a private mount namespace where applicable and do
+not replace the running system root.
 
 For real standby waits, use `enter-standby`. It prepares
 `/run/initramfs/shutdown`, which is systemd's supported late shutdown handoff
