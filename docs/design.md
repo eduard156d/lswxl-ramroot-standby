@@ -38,7 +38,7 @@ old root, md, SATA, USB can be released safely
 HDD/USB off, LED standby indication, fan cooldown starts
   |
   v
-wait for UDP Wake-on-LAN magic packet or switch change
+wait for Wake-on-LAN magic packet or switch change
   |
   v
 fan stops after cooldown, unless standby was already left
@@ -76,6 +76,18 @@ helper is still entering standby and preparing storage/rails, it uses a fast
 slower `1000ms/3000ms` pattern. `lsmonitor` also uses `amber:info` for fast
 busy/wake indication, but `lsmonitor` is no longer active during this late
 shutdown/RAM-root phase.
+
+## Wake Packets
+
+The wake helper accepts two Wake-on-LAN packet forms:
+
+- UDP magic packets received on the configured `WAKE_PORTS`, typically ports
+  `9` and `2304`.
+- Raw Ethernet Wake-on-LAN frames with EtherType `0x0842`. This is the form
+  observed from the AVM FRITZ!Box "Start Computer" function.
+
+Both paths use the same magic-packet check: six `0xff` bytes followed by the
+target MAC address repeated sixteen times.
 
 ## Storage Selection
 

@@ -101,6 +101,8 @@ Verified on one Buffalo LS-WXL test system running Debian GNU/Linux 12
 - `WAKE_TIMEOUT=300` times out cleanly when no packet is sent.
 - Sending a UDP magic packet to ports `9`/`2304` wakes the exitrd wait and logs
   `wake received rc=0`.
+- AVM FRITZ!Box "Start Computer" Wake-on-LAN sends a raw Ethernet WoL frame
+  with EtherType `0x0842`; the wake helper listens for that form as well.
 
 ## Optional USB Logging
 

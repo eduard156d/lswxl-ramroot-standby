@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <linux/if_ether.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,6 +13,10 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef ETH_P_WOL
+#define ETH_P_WOL 0x0842
+#endif
 
 static time_t monotime(void)
 {
@@ -81,6 +86,14 @@ static int bind_udp_port(int port)
 		close(fd);
 		return -1;
 	}
+	return fd;
+}
+
+static int open_wol_socket(void)
+{
+	int fd = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_WOL));
+	if (fd < 0)
+		return -1;
 	return fd;
 }
 
@@ -160,6 +173,7 @@ static int wait_wake_or_input(int argc, char **argv)
 	int input_fd = open_input(argv[4]);
 	if (input_fd < 0)
 		return 1;
+	int wol_fd = open_wol_socket();
 
 	int fds[16];
 	int nfds = 0;
@@ -177,7 +191,7 @@ static int wait_wake_or_input(int argc, char **argv)
 		if (fd2304 >= 0)
 			fds[nfds++] = fd2304;
 	}
-	if (nfds == 0) {
+	if (nfds == 0 && wol_fd < 0) {
 		perror("bind");
 		return 1;
 	}
@@ -192,6 +206,11 @@ static int wait_wake_or_input(int argc, char **argv)
 		FD_ZERO(&set);
 		FD_SET(input_fd, &set);
 		int maxfd = input_fd;
+		if (wol_fd >= 0) {
+			FD_SET(wol_fd, &set);
+			if (wol_fd > maxfd)
+				maxfd = wol_fd;
+		}
 		for (int i = 0; i < nfds; i++) {
 			FD_SET(fds[i], &set);
 			if (fds[i] > maxfd)
@@ -227,6 +246,19 @@ static int wait_wake_or_input(int argc, char **argv)
 			}
 			if (saw)
 				return 3;
+		}
+
+		if (wol_fd >= 0 && FD_ISSET(wol_fd, &set)) {
+			uint8_t buf[2048];
+			ssize_t len;
+			while ((len = recv(wol_fd, buf, sizeof(buf), 0)) > 0) {
+				if (is_magic_packet(buf, len, mac))
+					return 0;
+			}
+			if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+				perror("raw-wol recv");
+				return 1;
+			}
 		}
 
 		for (int i = 0; i < nfds; i++) {
